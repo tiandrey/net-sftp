@@ -53,6 +53,8 @@ module Net; module SFTP; module Operations
   #   defaults to 32,000 bytes.
   # * <tt>:name</tt> - the filename to report to the progress monitor when
   #   an IO object is given as +local+. This defaults to "<memory>".
+  # * <tt>:follow_symlinks</tt> - whether copy contents of symlinks or the
+  #   links themselves. Defaults to true.
   #
   # == Progress Monitoring
   #
@@ -147,6 +149,7 @@ module Net; module SFTP; module Operations
       @progress = progress || options[:progress]
       @options = options
       @properties = options[:properties] || {}
+      @follow_symlinks = options.fetch(:follow_symlinks, true)
       @active = 0
 
       self.logger = sftp.logger
@@ -283,22 +286,37 @@ module Net; module SFTP; module Operations
         if local.respond_to?(:read)
           file = local
           name = options[:name] || "<memory>"
+          symlink = false
         else
-          file = ::File.open(local, "rb")
+          if @follow_symlinks || ! ::File.symlink?(local)
+            file = ::File.open(local, "rb")
+            symlink = false
+          else
+            file = ::File.readlink(local)
+            symlink = true
+          end
           name = local
         end
 
         if file.respond_to?(:stat)
           size = file.stat.size
         else
-          size = file.size
+          if symlink
+            size = file.length
+          else
+            size = file.size
+          end
         end
 
         metafile = LiveFile.new(name, remote, file, size)
-        update_progress(:open, metafile)
-
-        request = sftp.open(remote, "w", &method(:on_open))
-        request[:file] = metafile
+        if symlink
+          update_progress(:symlink, metafile)
+          request = sftp.symlink(file, remote, &method(:on_symlink))
+        else
+          update_progress(:open, metafile)
+          request = sftp.open(remote, "w", &method(:on_open))
+        end
+          request[:file] = metafile
       end
 
       # Called when a +mkdir+ request finishes, successfully or otherwise.
@@ -338,6 +356,16 @@ module Net; module SFTP; module Operations
         file = response.request[:file]
         raise StatusException.new(response, "write #{file.remote}") unless response.ok?
         write_next_chunk(file)
+      end
+
+      # Called when a +symlink+ request finishes. Raises StatusException if the
+      # symlink failed, otherwise it calls #process_next_entry to continue the
+      # state machine.
+      def on_symlink(response)
+        @active -= 1
+        file = response.request[:file]
+        raise StatusException.new(response, "symlink #{file.remote}") unless response.ok?
+        process_next_entry
       end
 
       # Called when a +close+ request finishes. Raises a StatusException if the
